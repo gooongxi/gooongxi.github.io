@@ -1,1 +1,507 @@
-HELLO WORLD!
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gong Xi</title>
+<meta name="description" content="Gong Xi">
+<meta name="theme-color" content="#04040a">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9C%A6%3C/text%3E%3C/svg%3E">
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #04040a;
+    overflow: hidden;
+  }
+
+  body {
+    color: #e6e6f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #stage {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    cursor: crosshair;
+  }
+
+  /* Soft vignette so the glow falls off into the corners. */
+  #vignette {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse 120% 90% at 50% 50%, transparent 35%, rgba(4, 4, 10, 0.55) 100%);
+  }
+
+  #hint {
+    position: fixed;
+    left: 50%;
+    bottom: max(28px, env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    font-size: 11px;
+    letter-spacing: 0.32em;
+    text-transform: uppercase;
+    color: rgba(230, 230, 240, 0.28);
+    pointer-events: none;
+    white-space: nowrap;
+    opacity: 0;
+    animation: hint-in 1.6s ease 2.2s forwards;
+  }
+
+  @keyframes hint-in {
+    from { opacity: 0; transform: translateX(-50%) translateY(6px); }
+    to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    margin: -1px; padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #hint { animation: none; opacity: 1; }
+  }
+</style>
+</head>
+<body>
+
+<h1 class="sr-only">Gong Xi</h1>
+<canvas id="stage"></canvas>
+<div id="vignette"></div>
+<div id="hint">move &middot; click</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d', { alpha: false });
+
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // --- tunables -------------------------------------------------------------
+  var COLOR_A = [34, 211, 238];   // cyan
+  var COLOR_B = [232, 121, 249];  // magenta
+  var BUCKETS = 28;               // colour groups, so fillStyle is set 28x/frame not 6000x
+  var DAMP = 0.86;
+  var SPRING_MAX = 0.075;
+  var SPRING_MIN = 0.006;
+  var ENTRY_MS = 1200;
+  var REPEL_R = 115;
+  var REPEL_F = 2.4;
+  var BLAST_R = 320;
+  var BLAST_F = 15;
+  var TRAIL = 'rgba(4,4,10,0.30)';
+  var CORE_SIZE = 1.5;
+  var HALO_SIZE = 4.4;
+  var AMBIENT_N = 90;
+
+  // --- state ----------------------------------------------------------------
+  var W = 0, H = 0, dpr = 1;
+  var parts = [];
+  var buckets = [];
+  var coreColors = [];
+  var haloColors = [];
+  var ambient = [];
+  var pointer = { x: -9999, y: -9999, active: false };
+  var entryT = 0;
+  var clock = 0;
+  var lastTs = 0;
+  var rafId = 0;
+  var running = false;
+  var resizeTimer = 0;
+
+  // Offscreen canvas used purely to rasterise the name into target points.
+  var mask = document.createElement('canvas');
+  var mctx = mask.getContext('2d', { willReadFrequently: true });
+
+  function isCoarse() {
+    return window.matchMedia('(pointer: coarse)').matches || W < 700;
+  }
+
+  function maxParticles() {
+    return isCoarse() ? 2600 : 6500;
+  }
+
+  // --- colour ---------------------------------------------------------------
+  function buildPalette() {
+    coreColors.length = 0;
+    haloColors.length = 0;
+    for (var i = 0; i < BUCKETS; i++) {
+      var t = BUCKETS === 1 ? 0.5 : i / (BUCKETS - 1);
+      var r = Math.round(COLOR_A[0] + (COLOR_B[0] - COLOR_A[0]) * t);
+      var g = Math.round(COLOR_A[1] + (COLOR_B[1] - COLOR_A[1]) * t);
+      var b = Math.round(COLOR_A[2] + (COLOR_B[2] - COLOR_A[2]) * t);
+      coreColors.push('rgba(' + r + ',' + g + ',' + b + ',0.88)');
+      haloColors.push('rgba(' + r + ',' + g + ',' + b + ',0.085)');
+    }
+  }
+
+  // --- text rasterisation ---------------------------------------------------
+  function fitFont(lines, maxW, maxH) {
+    // Start from a size derived from the viewport, then shrink until it fits.
+    var size = Math.min(maxW / 4.2, maxH / (lines.length * 1.25));
+    for (var pass = 0; pass < 24; pass++) {
+      mctx.font = '900 ' + size + 'px ' + FONT_STACK;
+      try { mctx.letterSpacing = (size * 0.06) + 'px'; } catch (e) {}
+      var widest = 0;
+      for (var i = 0; i < lines.length; i++) {
+        widest = Math.max(widest, mctx.measureText(lines[i]).width);
+      }
+      if (widest <= maxW || size < 12) break;
+      size *= (maxW / widest) * 0.98;
+    }
+    return size;
+  }
+
+  var FONT_STACK = '"Helvetica Neue", Helvetica, Arial, "Segoe UI", sans-serif';
+
+  function samplePoints() {
+    mask.width = Math.max(1, Math.round(W));
+    mask.height = Math.max(1, Math.round(H));
+
+    var lines = (W < 760) ? ['GONG', 'XI'] : ['GONG XI'];
+    var maxW = W * 0.86;
+    var maxH = H * 0.7;
+
+    var size = fitFont(lines, maxW, maxH);
+
+    mctx.clearRect(0, 0, W, H);
+    mctx.fillStyle = '#fff';
+    mctx.textAlign = 'center';
+    mctx.textBaseline = 'middle';
+    mctx.font = '900 ' + size + 'px ' + FONT_STACK;
+    try { mctx.letterSpacing = (size * 0.06) + 'px'; } catch (e) {}
+
+    var lineH = size * 1.06;
+    var startY = H / 2 - (lines.length - 1) * lineH / 2;
+    for (var i = 0; i < lines.length; i++) {
+      mctx.fillText(lines[i], W / 2, startY + i * lineH);
+    }
+
+    var data = mctx.getImageData(0, 0, mask.width, mask.height).data;
+    var cap = maxParticles();
+    var step = isCoarse() ? 4 : 3;
+    var pts = scan(data, mask.width, mask.height, step);
+    while (pts.length > cap && step < 14) {
+      step++;
+      pts = scan(data, mask.width, mask.height, step);
+    }
+    return pts;
+  }
+
+  function scan(data, w, h, step) {
+    var pts = [];
+    for (var y = 0; y < h; y += step) {
+      var row = y * w * 4;
+      for (var x = 0; x < w; x += step) {
+        if (data[row + x * 4 + 3] > 128) pts.push(x, y);
+      }
+    }
+    return pts;
+  }
+
+  // --- particles ------------------------------------------------------------
+  function build() {
+    var pts = samplePoints();
+    var n = pts.length / 2;
+
+    var minX = Infinity, maxX = -Infinity;
+    for (var i = 0; i < n; i++) {
+      var px = pts[i * 2];
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+    }
+    var span = Math.max(1, maxX - minX);
+
+    var cx = W / 2, cy = H / 2;
+    var spawnR = Math.max(W, H) * 0.6;
+
+    // Reuse existing particles across resizes so the name morphs instead of
+    // being rebuilt from scratch.
+    if (parts.length > n) parts.length = n;
+    while (parts.length < n) {
+      var a = Math.random() * Math.PI * 2;
+      var r = spawnR + Math.random() * spawnR * 0.8;
+      var ph = Math.random() * Math.PI * 2;
+      parts.push({
+        x: cx + Math.cos(a) * r,
+        y: cy + Math.sin(a) * r,
+        vx: 0, vy: 0,
+        tx: cx, ty: cy,
+        sp: Math.sin(ph),
+        cp: Math.cos(ph),
+        ci: 0
+      });
+    }
+
+    for (var b = 0; b < BUCKETS; b++) buckets[b] = [];
+    for (var j = 0; j < n; j++) {
+      var p = parts[j];
+      p.tx = pts[j * 2];
+      p.ty = pts[j * 2 + 1];
+      var ci = Math.round(((p.tx - minX) / span) * (BUCKETS - 1));
+      p.ci = ci < 0 ? 0 : (ci > BUCKETS - 1 ? BUCKETS - 1 : ci);
+      buckets[p.ci].push(p);
+      if (reduced) { p.x = p.tx; p.y = p.ty; p.vx = 0; p.vy = 0; }
+    }
+  }
+
+  function buildAmbient() {
+    ambient.length = 0;
+    for (var i = 0; i < AMBIENT_N; i++) {
+      ambient.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        vx: (Math.random() - 0.5) * 0.09,
+        vy: (Math.random() - 0.5) * 0.09,
+        s: 0.6 + Math.random() * 1.3,
+        a: 0.06 + Math.random() * 0.13,
+        d: 0.3 + Math.random() * 0.7
+      });
+    }
+  }
+
+  // --- layout ---------------------------------------------------------------
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#04040a';
+    ctx.fillRect(0, 0, W, H);
+    build();
+    buildAmbient();
+  }
+
+  // --- simulation -----------------------------------------------------------
+  function update(f) {
+    var progress = reduced ? 1 : Math.min(1, entryT / ENTRY_MS);
+    var eased = progress * progress * (3 - 2 * progress);
+    var k = SPRING_MIN + (SPRING_MAX - SPRING_MIN) * eased;
+    var breathe = !reduced && progress > 0.85;
+
+    // sin(t + phase) expanded so the inner loop stays trig-free.
+    var s1 = Math.sin(clock * 0.0009), c1 = Math.cos(clock * 0.0009);
+    var s2 = Math.sin(clock * 0.0007), c2 = Math.cos(clock * 0.0007);
+
+    var damp = Math.pow(DAMP, f);
+    var px = pointer.x, py = pointer.y, active = pointer.active;
+    var R = REPEL_R, R2 = R * R, RF = REPEL_F * f;
+    var kf = k * f;
+    var moving = 0;
+
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      var tx = p.tx, ty = p.ty;
+
+      if (breathe) {
+        tx += (s1 * p.cp + c1 * p.sp) * 1.3;
+        ty += (c2 * p.cp - s2 * p.sp) * 1.3;
+      }
+
+      p.vx += (tx - p.x) * kf;
+      p.vy += (ty - p.y) * kf;
+
+      if (active) {
+        var dx = p.x - px, dy = p.y - py;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < R2 && d2 > 0.01) {
+          var d = Math.sqrt(d2);
+          var fall = 1 - d / R;
+          var s = (fall * fall * RF) / d;
+          p.vx += dx * s;
+          p.vy += dy * s;
+        }
+      }
+
+      p.vx *= damp;
+      p.vy *= damp;
+      p.x += p.vx * f;
+      p.y += p.vy * f;
+
+      moving += Math.abs(p.vx) + Math.abs(p.vy);
+    }
+
+    for (var j = 0; j < ambient.length; j++) {
+      var a = ambient[j];
+      a.x += a.vx * f;
+      a.y += a.vy * f;
+      if (a.x < -4) a.x = W + 4; else if (a.x > W + 4) a.x = -4;
+      if (a.y < -4) a.y = H + 4; else if (a.y > H + 4) a.y = -4;
+    }
+
+    return parts.length ? moving / parts.length : 0;
+  }
+
+  function draw() {
+    ctx.globalCompositeOperation = 'source-over';
+    if (reduced) {
+      ctx.fillStyle = '#04040a';
+    } else {
+      ctx.fillStyle = TRAIL;
+    }
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Ambient dust, with a touch of parallax toward the pointer.
+    var ox = pointer.active ? (pointer.x - W / 2) * 0.012 : 0;
+    var oy = pointer.active ? (pointer.y - H / 2) * 0.012 : 0;
+    for (var j = 0; j < ambient.length; j++) {
+      var a = ambient[j];
+      ctx.fillStyle = 'rgba(150,190,255,' + a.a + ')';
+      ctx.fillRect(a.x + ox * a.d, a.y + oy * a.d, a.s, a.s);
+    }
+
+    var half = HALO_SIZE / 2;
+    var chalf = CORE_SIZE / 2;
+
+    for (var b = 0; b < BUCKETS; b++) {
+      var list = buckets[b];
+      if (!list || !list.length) continue;
+
+      ctx.fillStyle = haloColors[b];
+      for (var i = 0; i < list.length; i++) {
+        var p = list[i];
+        ctx.fillRect(p.x - half, p.y - half, HALO_SIZE, HALO_SIZE);
+      }
+
+      ctx.fillStyle = coreColors[b];
+      for (var m = 0; m < list.length; m++) {
+        var q = list[m];
+        ctx.fillRect(q.x - chalf, q.y - chalf, CORE_SIZE, CORE_SIZE);
+      }
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function frame(ts) {
+    if (!lastTs) lastTs = ts;
+    var dt = ts - lastTs;
+    lastTs = ts;
+    if (dt > 100) dt = 100;
+
+    var f = dt / 16.6667;
+    if (f < 0.4) f = 0.4;
+    if (f > 2.2) f = 2.2;
+
+    clock += dt;
+    entryT += dt;
+
+    var energy = update(f);
+    draw();
+
+    // In reduced-motion mode the loop parks itself once things settle.
+    if (reduced && !pointer.active && energy < 0.02) {
+      running = false;
+      rafId = 0;
+      return;
+    }
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function start() {
+    if (running || document.hidden) return;
+    running = true;
+    lastTs = 0;
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  // --- input ----------------------------------------------------------------
+  function onMove(e) {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.active = true;
+    start();
+  }
+
+  function onLeave() {
+    pointer.active = false;
+    pointer.x = -9999;
+    pointer.y = -9999;
+    start();
+  }
+
+  function blast(x, y) {
+    var R2 = BLAST_R * BLAST_R;
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      var dx = p.x - x, dy = p.y - y;
+      var d2 = dx * dx + dy * dy;
+      if (d2 < R2) {
+        var d = Math.sqrt(d2) || 0.001;
+        var fall = 1 - d / BLAST_R;
+        var s = (fall * fall * BLAST_F) / d;
+        p.vx += dx * s;
+        p.vy += dy * s;
+      }
+    }
+    start();
+  }
+
+  window.addEventListener('pointermove', onMove, { passive: true });
+  window.addEventListener('pointerdown', function (e) {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.active = true;
+    blast(e.clientX, e.clientY);
+  }, { passive: true });
+  window.addEventListener('pointerup', function (e) {
+    if (e.pointerType !== 'mouse') onLeave();
+  }, { passive: true });
+  window.addEventListener('pointercancel', onLeave, { passive: true });
+  document.addEventListener('mouseleave', onLeave);
+
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      resize();
+      start();
+    }, 150);
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) stop();
+    else start();
+  });
+
+  // --- go -------------------------------------------------------------------
+  buildPalette();
+  resize();
+
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(function () { build(); });
+  }
+
+  start();
+})();
+</script>
+
+</body>
+</html>
