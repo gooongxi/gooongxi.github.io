@@ -189,7 +189,7 @@ function nameShape(n, twoLine) {
 
   var scale = WORLD_W / Math.max(1, maxX - minX);
   var cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-  var thick = WORLD_W * 0.030;
+  var thick = WORLD_W * 0.018;
   nameH = (maxY - minY) * scale;
 
   for (var i = 0; i < n; i++) {
@@ -458,7 +458,11 @@ void main(){
   vec4 clip = uViewProj * vec4(pos, 1.0);
   gl_Position = clip;
 
-  vT = length(pos) * 0.115 + uTime * 0.045 + vSpeed * 0.22 + seed * 0.30;
+  // Hue must vary across SPACE, not per particle — a big seed term here reads as
+  // RGB noise. Sweeping mainly along x keeps it a gradient rather than a
+  // symmetric rainbow radiating from the centre.
+  vT = pos.x * 0.13 + pos.y * 0.05 + length(pos) * 0.05
+     + uTime * 0.045 + vSpeed * 0.12 + seed * 0.03;
   gl_PointSize = clamp(uSize / max(clip.w, 0.25) * (1.0 + vSpeed * uStretch), 0.7, 22.0);
 }`;
 
@@ -469,9 +473,10 @@ in float vT;
 uniform float uBright;
 out vec4 frag;
 
+// Narrow phase spread → an oil-slick sweep rather than a full ROYGBIV rainbow.
 vec3 pal(float t){
-  return vec3(0.42, 0.40, 0.48)
-       + vec3(0.44, 0.40, 0.46) * cos(6.28318530718 * (t + vec3(0.14, 0.42, 0.72)));
+  return vec3(0.46, 0.42, 0.52)
+       + vec3(0.40, 0.36, 0.44) * cos(6.28318530718 * (t + vec3(0.00, 0.16, 0.36)));
 }
 
 void main(){
@@ -512,6 +517,8 @@ float fbm(vec2 p){
   return s;
 }
 
+// Stars need to be a few px across, not one — single-pixel stars get torn into
+// red/green/blue fringes by the chromatic aberration and read as sensor noise.
 float stars(vec2 uv, float scale, float thr){
   vec2 g = uv * scale;
   vec2 id = floor(g), f = fract(g);
@@ -519,27 +526,28 @@ float stars(vec2 uv, float scale, float thr){
   if (r < thr) return 0.0;
   vec2 c = vec2(h21(id + 3.1), h21(id + 7.7));
   float d = length(f - c);
-  float tw = 0.65 + 0.35 * sin(uTime * (1.2 + r * 2.4) + r * 30.0);
-  return smoothstep(0.055, 0.0, d) * (r - thr) / (1.0 - thr) * tw;
+  float tw = 0.62 + 0.38 * sin(uTime * (1.0 + r * 2.0) + r * 30.0);
+  return smoothstep(0.10, 0.0, d) * pow((r - thr) / (1.0 - thr), 1.5) * tw;
 }
 
 void main(){
   vec2 uv = vUv;
   vec2 p = (uv - 0.5) * vec2(uRes.x / uRes.y, 1.0);
 
-  // deep space gradient with a faint warm core behind the subject
-  vec3 col = mix(vec3(0.012, 0.012, 0.030), vec3(0.028, 0.020, 0.052), uv.y);
-  col += vec3(0.055, 0.030, 0.075) * exp(-dot(p, p) * 2.6);
+  // Everything here is LINEAR light — the composite pass gamma-encodes at the
+  // end, so these constants are ~12x smaller than the values they display as.
+  vec3 col = mix(vec3(0.0010, 0.0010, 0.0026), vec3(0.0024, 0.0017, 0.0046), uv.y);
+  col += vec3(0.0070, 0.0038, 0.0095) * exp(-dot(p, p) * 2.6);
 
-  float s = stars(uv, 90.0, 0.965) * 0.9
-          + stars(uv + 11.3, 46.0, 0.972) * 1.3
-          + stars(uv + 27.7, 24.0, 0.982) * 1.8;
-  col += vec3(0.85, 0.90, 1.0) * s;
+  float s = stars(uv, 64.0, 0.955) * 0.22
+          + stars(uv + 11.3, 30.0, 0.965) * 0.40
+          + stars(uv + 27.7, 16.0, 0.975) * 0.62;
+  col += mix(vec3(0.70, 0.80, 1.0), vec3(1.0, 0.90, 0.76), h21(floor(uv * 64.0))) * s;
 
   // aurora ribbon low in frame
   float band = smoothstep(0.42, 0.0, uv.y);
   float n = fbm(vec2(uv.x * 2.6 - uTime * 0.035, uv.y * 3.4 + uTime * 0.02));
-  float a = smoothstep(0.46, 0.78, n) * band * 0.30;
+  float a = smoothstep(0.52, 0.86, n) * band * 0.055;
   col += mix(vec3(0.10, 0.42, 0.46), vec3(0.34, 0.14, 0.50), uv.x) * a;
 
   // occasional shooting star
@@ -631,14 +639,15 @@ void main(){
 
   col *= uExposure;
   col = aces(col);
+  col = pow(max(col, 0.0), vec3(0.4545));
 
-  // film grain + vignette
+  // grain and vignette belong in display space — applying them before the
+  // gamma encode above turns 0.02 of grain into 0.18 of visible noise
   float g = hash(uv * 1024.0 + fract(uTime) * 137.0) - 0.5;
-  col += g * 0.022;
-  col *= 1.0 - smoothstep(0.18, 0.85, r2) * 0.75;
+  col += g * 0.016;
+  col *= 1.0 - smoothstep(0.10, 0.62, r2) * 0.80;
 
-  col *= uFade;
-  frag = vec4(pow(max(col, 0.0), vec3(0.4545)), 1.0);
+  frag = vec4(max(col, 0.0) * uFade, 1.0);
 }`;
 
 // ═════════════════════════════════════════════════════════════ boot
@@ -764,7 +773,10 @@ var sceneTex = null, sceneFbo = null;
 var bloomA = [], bloomB = [], bloomFA = [], bloomFB = [];
 
 var shapes = {};
-var shapeIdx = 0, nextIdx = 1;
+// ?shape=name|galaxy|helix|globe freezes on one state, spawned already settled
+var frozen = SHAPES.indexOf(flags.get('shape') || '');
+var shapeIdx = frozen >= 0 ? frozen : 0;
+var nextIdx = frozen >= 0 ? frozen : 1;
 var morph = 0, phase = 'hold', phaseT = 0;
 
 var FOV = 48 * Math.PI / 180;
@@ -779,7 +791,12 @@ var SHAPE_SIZE = {
   globe:  [WORLD_W * 0.74, WORLD_W * 0.74]
 };
 
-var cam = { yaw: 0, pitch: 0.12, dist: 5.4, vYaw: 0, vPitch: 0, zoom: 1 };
+// The name is a thin slab: a full auto-orbit leaves it edge-on and unreadable
+// most of the time. So the abstract shapes orbit freely and the name settles
+// back to front-on.
+var ORBITNESS = { name: 0, galaxy: 1, helix: 1, globe: 1 };
+
+var cam = { yaw: 0, pitch: 0.12, dist: 5.4, vYaw: 0, vPitch: 0, zoom: 1, orbit: 0 };
 var dragging = false, lastPX = 0, lastPY = 0, dragDist = 0;
 var pointer = { x: 0, y: 0, on: false };
 var blasts = [
@@ -824,7 +841,7 @@ function allocParticles() {
   var cur = shapes[SHAPES[shapeIdx]];
 
   for (var i = 0; i < N; i++) {
-    if (ready) {
+    if (ready || frozen >= 0) {
       // a mid-session quality change must not replay the fly-in
       p0[i * 4] = cur[i * 4];
       p0[i * 4 + 1] = cur[i * 4 + 1];
@@ -921,25 +938,42 @@ function fitDist(w, h) {
 
 function updateCamera(dt) {
   if (!dragging) {
-    // release inertia, then hand back to the slow auto-orbit
+    // release inertia
     cam.yaw += cam.vYaw * dt;
     cam.pitch += cam.vPitch * dt;
     var decay = Math.pow(0.12, dt);
     cam.vYaw *= decay;
     cam.vPitch *= decay;
-    if (!reduced) cam.yaw += AUTO_YAW * (phase === 'morph' ? 2.6 : 1.0) * dt;
   }
   cam.pitch = Math.max(-1.2, Math.min(1.2, cam.pitch));
 
-  var a = SHAPE_SIZE[SHAPES[shapeIdx]], b = SHAPE_SIZE[SHAPES[nextIdx]];
+  var ca = SHAPES[shapeIdx], cb = SHAPES[nextIdx];
+  var orbitAmt = ORBITNESS[ca] + (ORBITNESS[cb] - ORBITNESS[ca]) * morph;
+
+  var sway = 0, swayP = 0;
+  if (!reduced) {
+    var s = clock * 0.001;
+    cam.orbit += AUTO_YAW * orbitAmt * dt;
+    // ease back to front-on whenever the name is the active shape
+    if (orbitAmt < 0.5) {
+      var home = Math.round(cam.orbit / (Math.PI * 2)) * Math.PI * 2;
+      cam.orbit += (home - cam.orbit) * Math.min(1, dt * 0.8);
+    }
+    sway = Math.sin(s * 0.17) * 0.40 * (1 - orbitAmt);
+    swayP = Math.sin(s * 0.11 + 1.3) * 0.10;
+  }
+
+  var a = SHAPE_SIZE[ca], b = SHAPE_SIZE[cb];
   var want = fitDist(a[0] + (b[0] - a[0]) * morph,
                      a[1] + (b[1] - a[1]) * morph) * cam.zoom;
   cam.dist += (want - cam.dist) * Math.min(1, dt * 3.2);
 
-  var cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-  eye[0] = Math.sin(cam.yaw) * cp * cam.dist;
+  var yaw = cam.yaw + cam.orbit + sway;
+  var pitch = Math.max(-1.2, Math.min(1.2, cam.pitch + swayP));
+  var cp = Math.cos(pitch), sp = Math.sin(pitch);
+  eye[0] = Math.sin(yaw) * cp * cam.dist;
   eye[1] = sp * cam.dist;
-  eye[2] = Math.cos(cam.yaw) * cp * cam.dist;
+  eye[2] = Math.cos(yaw) * cp * cam.dist;
 
   perspective(proj, FOV, W / H, 0.1, 200);
   lookAt(view, eye, [0, 0, 0], [0, 1, 0]);
@@ -953,7 +987,7 @@ function updateCamera(dt) {
 // ───────────────────────────────────────────────────── choreography
 
 function updateShapes(dtMs) {
-  if (reduced) { morph = 0; return; }
+  if (reduced || frozen >= 0) { morph = 0; return; }
   phaseT += dtMs;
   if (phase === 'hold') {
     if (phaseT >= DWELL[shapeIdx]) { phase = 'morph'; phaseT = 0; }
@@ -1013,7 +1047,7 @@ function drawParticles() {
   var base = sceneH * (coarse ? 0.0032 : 0.0026) * (1 + (1 - intro) * 0.7);
   gl.uniform1f(progParticle.u('uSize'), base * cam.dist);
   gl.uniform1f(progParticle.u('uStretch'), 0.055);
-  gl.uniform1f(progParticle.u('uBright'), 0.85 + morphBurst() * 0.25);
+  gl.uniform1f(progParticle.u('uBright'), 1.0 + morphBurst() * 0.25);
   gl.uniform1f(progParticle.u('uNoiseAmp'), 0.035 + morphBurst() * 0.5);
   gl.uniform1f(progParticle.u('uNoiseFreq'), 0.9);
 
@@ -1025,7 +1059,7 @@ function drawBloom() {
   progBright.use();
   bindTex(0, sceneTex);
   gl.uniform1i(progBright.u('uTex'), 0);
-  gl.uniform1f(progBright.u('uThreshold'), 0.42);
+  gl.uniform1f(progBright.u('uThreshold'), 0.22);
   bindFbo(bloomFA[0], bloomA[0]._w, bloomA[0]._h);
   quad();
 
@@ -1071,8 +1105,8 @@ function composite() {
   // bloom flash as the particles lock into the name
   var flash = reduced ? 0 : Math.max(0, 1 - Math.abs(introT - 2150) / 480);
   gl.uniform1f(progComp.u('uExposure'), 1.05 + flash * 0.9);
-  gl.uniform1f(progComp.u('uBloom'), 1.0 + flash * 1.1 + morphBurst() * 0.35);
-  gl.uniform1f(progComp.u('uCA'), 0.010 + morphBurst() * 0.020);
+  gl.uniform1f(progComp.u('uBloom'), 1.30 + flash * 1.1 + morphBurst() * 0.35);
+  gl.uniform1f(progComp.u('uCA'), 0.0045 + morphBurst() * 0.012);
   gl.uniform1f(progComp.u('uFade'), reduced ? 1 : smoothstep(introT / 400));
   quad();
 }
@@ -1286,7 +1320,8 @@ function boot() {
   gl.clearColor(0, 0, 0, 1);
   gl.disable(gl.DEPTH_TEST);
   ready = true;
-  introT = 0;
+  introT = frozen >= 0 ? 99999 : 0;
+  cam.dist = fitDist(SHAPE_SIZE[SHAPES[shapeIdx]][0], SHAPE_SIZE[SHAPES[shapeIdx]][1]);
   start();
   setTimeout(function () { hintEl.classList.add('on'); }, reduced ? 400 : 3400);
 }
